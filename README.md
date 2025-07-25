@@ -1,5 +1,3 @@
-# app1
-# Load required libraries
 library(shiny)
 library(shinydashboard)
 library(dplyr)
@@ -7,6 +5,17 @@ library(ggplot2)
 library(forecast)
 library(plotly)
 library(DT)
+library(rsconnect)
+library(httr)
+library(curl)
+library(jsonlite)
+library(urltools)
+library(webutils)
+library(xml2)
+library(rvest)
+
+# Load data
+crop_yield_2000_2023 <- read_csv("C:/Users/TableauUser/Downloads/FAO- African crop yield 2000-2023.csv")
 
 # African countries list
 african_countries <- c(
@@ -22,21 +31,6 @@ african_countries <- c(
   "Zimbabwe"
 )
 
-# Default sample dataset
-if (!exists("crop_yield_2000_2023")) {
-  crop_yield_2000_2023 <- data.frame(
-    Area = rep(c("Kenya", "Nigeria", "South Africa"), each = 8),
-    Item = rep(c("Maize (corn)", "Wheat"), times = 12),
-    Year = rep(c(2000, 2001, 2002, 2023), times = 6),
-    Value = c(1800.5,око
-
-, 1850.2, 1900.1, 2000.4, 1600.8, 1650.3, 1700.5, 1800.9,
-              2500.3, 2600.7, 2650.2, 2700.1, 1200.7, 1250.4, 1300.1, 1400.5,
-              1100.2, 1150.6, 1200.3, 1250.8, 2000.1, 2100.4, 2150.2, 2200.6),
-    `Flag Description` = rep(c("Official data", "Estimated value"), times = 12)
-  )
-}
-
 # --- UI ---
 ui <- dashboardPage(
   dashboardHeader(title = "Africa Crop Yield Dashboard"),
@@ -47,11 +41,6 @@ ui <- dashboardPage(
       menuItem("Forecast", tabName = "forecast", icon = icon("chart-line")),
       menuItem("Crop Risk", tabName = "crop_risk", icon = icon("exclamation-triangle"))
     ),
-    fileInput("file_upload", "Upload Crop Yield CSV",
-              accept = c(".csv"),
-              multiple = FALSE,
-              placeholder = "Select a CSV file (max 10MB)",
-              size = 10 * 1024 * 1024), # 10 MB limit
     selectInput("selected_item", "Select Crop:",
                 choices = NULL, selected = "All Crops"),
     selectInput("selected_countries", "Select Countries (up to 2):",
@@ -72,7 +61,10 @@ ui <- dashboardPage(
                 valueBoxOutput("kpi_trend", width = 3),
                 valueBoxOutput("kpi_percent_increase", width = 3)
               ),
-              uiOutput("overview_plots")
+              uiOutput("overview_plots"),
+              fluidRow(
+                box(plotlyOutput("trend_plot"), width = 12, title = "Yield Trend Over Time")
+              )
       ),
       tabItem(tabName = "analysis",
               fluidRow(
@@ -80,7 +72,7 @@ ui <- dashboardPage(
                 box(tableOutput("outliers_table"), width = 6)
               ),
               fluidRow(
-                box(DT::DTOutput("comparison_table"), width = 12)
+                box(DTOutput("comparison_table"), width = 12)
               )
       ),
       tabItem(tabName = "forecast",
@@ -96,7 +88,7 @@ ui <- dashboardPage(
       ),
       tabItem(tabName = "crop_risk",
               fluidRow(
-                box(DT::DTOutput("crops_in_danger_table"), width = 12)
+                box(DTOutput("crops_in_danger_table"), width = 12)
               )
       )
     )
@@ -106,50 +98,20 @@ ui <- dashboardPage(
 # --- Server ---
 server <- function(input, output, session) {
   
-  # Reactive: Load and validate uploaded data
-  uploaded_data <- reactive({
-    if (is.null(input$file_upload)) {
-      return(crop_yield_2000_2023)
-    }
-    
-    req(input$file_upload)
-    
-    # Validate file size (redundant with fileInput limit, but good practice)
-    if (input$file_upload$size > 10 * 1024 * 1024) {
-      showNotification("Uploaded file exceeds 10MB limit.", type = "error")
-      return(crop_yield_2000_2023)
-    }
-    
-    df <- read.csv(input$file_upload$datapath, stringsAsFactors = FALSE)
-    
-    # Validate required columns
-    required_cols <- c("Area", "Item", "Year", "Value", "Flag Description")
-    if (!all(required_cols %in% colnames(df))) {
-      showNotification("Uploaded CSV must contain columns: Area, Item, Year, Value, Flag Description", type = "error")
-      return(crop_yield_2000_2023)
-    }
-    
-    # Ensure data types
-    df <- df %>%
+  # Reactive: Filter for African countries
+  africa_data <- reactive({
+    crop_yield_2000_2023 %>%
+      filter(Area %in% african_countries) %>%
+      select(Area, Item, Year, Value) %>%
       mutate(
         Area = as.character(Area),
         Item = as.character(Item),
         Year = as.integer(Year),
-        Value = as.numeric(Value),
-        `Flag Description` = as.character(`Flag Description`)
+        Value = as.numeric(Value)
       )
-    
-    df
   })
   
-  # Reactive: Filter for African countries
-  africa_data <- reactive({
-    uploaded_data() %>%
-      filter(Area %in% african_countries) %>%
-      select(Area, Item, Year, Value, `Flag Description`)
-  })
-  
-  # Update selectInput choices based on data
+  # Update selectInput choices
   observe({
     data <- africa_data()
     updateSelectInput(session, "selected_item",
@@ -348,6 +310,35 @@ server <- function(input, output, session) {
     } else {
       fluidRow()
     }
+  })
+  
+  # Overview: Trend Plot
+  output$trend_plot <- renderPlotly({
+    req(input$selected_item, input$selected_countries)
+    data <- filtered_data()
+    
+    plot_data <- data %>%
+      group_by(Year, Area) %>%
+      summarise(Avg_Yield = mean(Value, na.rm = TRUE), .groups = "drop")
+    
+    title_text <- if (input$selected_item == "All Crops" && "All Countries" %in% input$selected_countries) {
+      "Africa-Wide Average Yield (All Crops)"
+    } else if (input$selected_item != "All Crops" && "All Countries" %in% input$selected_countries) {
+      paste("Yield Trend for", input$selected_item, "in Africa")
+    } else if (input$selected_item == "All Crops" && !("All Countries" %in% input$selected_countries)) {
+      paste("Yield Trend in", paste(input$selected_countries, collapse = ", "), "(All Crops)")
+    } else {
+      paste("Yield Trend for", input$selected_item, "in", paste(input$selected_countries, collapse = ", "))
+    }
+    
+    p <- ggplot(plot_data, aes(x = Year, y = Avg_Yield, color = Area)) +
+      geom_line(linewidth = 1) +
+      geom_point(size = 2) +
+      labs(title = title_text, x = "Year", y = "Yield (kg/ha)") +
+      theme_minimal() +
+      ylim(0, max(plot_data$Avg_Yield, na.rm = TRUE) * 1.1)
+    
+    ggplotly(p) %>% config(displayModeBar = FALSE)
   })
   
   # Overview: Top 10 Crops Plot
